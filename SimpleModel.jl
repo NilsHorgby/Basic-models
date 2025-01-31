@@ -1,6 +1,8 @@
 using Plots
 using Random
 using StatsBase
+using Distributions: Normal
+using Unzip
 
 #Constants
 const individuals_per_patch = 100
@@ -42,9 +44,6 @@ function create_population()
     return patches
 end
 
-getfield(create_subpopulation(1),:males)
-
-
 #this mating function pools all gametes in one pool
 function local_mating(patch::Patch)::Patch
     #select a random allele from each parent
@@ -69,18 +68,11 @@ function global_mating(population::Vector{Patch})::Vector{Patch}
     return local_mating.(population)
 end
 
-using Distributions: Normal
-
-
-struct SexSpecificPatch
-    individuals::Vector{Individual}
-    sex::Bool
-    location::Int
-end
 
 #An updated version of the migration function, this time it is non-recursive
+#now it also applies selection before the migration function finalizes, improving performace
 #The older version is still present below, but it will overflow the stack for large populations
-function migration(population::Vector{Patch})::Vector{Patch}
+function migration_and_selection(population::Vector{Patch})::Vector{Patch}
     function migration_one_sex(population::Vector{Patch}, sex::Symbol)::Vector{Vector{Individual}}
         current_individuals= [[(ind,patch.location) for ind in getfield(patch, sex)] for patch in population]
         current_individuals = reduce(vcat,reduce(hcat, current_individuals))
@@ -92,11 +84,27 @@ function migration(population::Vector{Patch})::Vector{Patch}
             return (individual[1],location)
         end
 
-        next_individuals = migrate_one_individual.(current_individuals)
-        next_patches = [[] for i in 1:number_of_patches]
+        next_individuals = migrate_one_individual.(current_individuals) #we might want this as an Array instead
 
         #if the the selection is applied here on the Vector{Tuple{Individual, Int64}} we can avoid iterating over all the individuals
-        for (i,individual) in enumerate(next_individuals)
+        #calculate the fitness of the individuals and return (individual,fitness)
+        function calculate_fitness(individual::Tuple{Individual,Int64})::Tuple{Individual,Int64,Float64}
+            location = individual[2]
+            deliterios_alleles = (location < number_of_patches/2) ? sum(individual[1].genome) : sum(broadcast(~,individual[1].genome))
+            return (individual[1],individual[2],1 - selection_cofficient*deliterios_alleles)
+        end
+        #take a sample of the individuals based on their fitness
+        function selection(population::Vector{Tuple{Individual,Int64,Float64}})::Vector{Tuple{Individual,Int64}}
+            individuals, locations, fitnesses = unzip(population)
+            selected_individuals = sample(zip(individuals,locations)|>collect, Weights(fitnesses),Int(floor(individuals_left_after_selection)), replace=false)
+            return selected_individuals
+        end
+
+        selected_individuals = selection(calculate_fitness.(next_individuals))
+        next_patches = [[] for i in 1:number_of_patches]
+
+        
+        for (i,individual) in enumerate(selected_individuals)
             push!(next_patches[individual[2]],individual[1])
         end
         
@@ -112,86 +120,10 @@ function migration(population::Vector{Patch})::Vector{Patch}
 
     return combine_males_and_females.(female_patches,male_patches,1:50)
 end
+population = create_population() |> global_mating
 
+migration_and_selection(population)
 
-
-#this function as the side effect of making the current population empty, the population must be assigned to the next population
-#This function is a bit of recersive mess, but it should work
-function recursive_migration(population::Vector{Patch})::Vector{Patch}
-    current_females = [SexSpecificPatch(patch.females,false, patch.location) for patch in population]
-    current_males = [SexSpecificPatch(patch.males,true, patch.location) for patch in population]
-    next_females::Vector{SexSpecificPatch} = [SexSpecificPatch([],false,population[i].location)
-                                              for i=eachindex(population)]
-    next_males::Vector{SexSpecificPatch} = [SexSpecificPatch([],true,population[i].location)
-                                            for i=eachindex(population)]
-    #migration one by one:
-
-    function put_within_boundaries(location,signed_distance)
-        new_patch::Int64 = location + signed_distance
-        if new_patch <= 0
-            return 1
-        elseif new_patch > number_of_patches
-            return number_of_patches
-        else 
-            return new_patch
-        end
-    end
-    
-    function migrate_one_individual(population::Vector{SexSpecificPatch},next_population::Vector{SexSpecificPatch})
-        individual::Individual= population[1].individuals[1]
-        signed_distance::Int64 = Int(round(rand(Normal(0,1.5),1)[1]))
-        deleteat!(population[1].individuals,1)
-        
-        #Boundary condition: if the individual tries to go outside the area, it doesn't move
-        new_patch = put_within_boundaries(population[1].location,signed_distance)
-        append!(next_population[new_patch].individuals,[individual])  
-        if length(population[1].individuals) == 0
-            deleteat!(population,1)
-        end
-        return population,next_population
-    end
-    
-    #we should be able to do tail recursion here
-    function migrate(population::Vector{SexSpecificPatch},next_population::Vector{SexSpecificPatch})
-        if population == []
-            return next_population
-        else
-            return migrate(migrate_one_individual(population,next_population)...)
-        end
-    end
-
-    
-    function combine_males_and_females(females::SexSpecificPatch,males::SexSpecificPatch)::Patch
-        @assert females.location == males.location "The locations are not the same"
-        return Patch(females.individuals,males.individuals, females.location)
-    end
-    return combine_males_and_females.(migrate(current_females,next_females),migrate(current_males,next_males))
-end
-
-#Selection
-
-function calculate_fitness(individual::Individual, location::Int64)::Float64
-    #returns:
-        #1 if the individual has no deliterious alleles
-        #1 - selection_cofficient if the individual has one deliterious allele
-        #1 - 2*selection_cofficient if the individual has two deliterious alleles
-    deliterios_alleles = (location < number_of_patches/2) ? sum(individual.genome) : sum(broadcast(~,individual.genome)) #if the individual is in the first half of the patches, the first allele is the deliterious one, otherwise the second allele is the deliterious one
-    return 1 - selection_cofficient*deliterios_alleles
-end
-
-
-
-function selection(population::Vector{Patch})::Vector{Patch}
-    function selection_by_patch(patch::Patch)::Patch
-        calculate_fitness_partial = ((ind) -> calculate_fitness(ind,patch.location))
-        male_fitnesses = calculate_fitness_partial.(patch.males)
-        female_fitnesses = calculate_fitness_partial.(patch.females)
-        males_remaining = sample(patch.males, Weights(male_fitnesses),Int(floor(individuals_left_after_selection/2)), replace=false)
-        female_remaining = sample(patch.females, Weights(female_fitnesses),Int(floor(individuals_left_after_selection/2)), replace=false)
-        return Patch(female_remaining,males_remaining,patch.location)
-    end
-    return selection_by_patch.(population)
-end
 
 
 function get_allele_frequencies(population::Vector{Patch}, generations::Int64)::Vector{Float64}
