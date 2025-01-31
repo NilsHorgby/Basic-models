@@ -5,14 +5,14 @@ using StatsBase
 #Constants
 const individuals_per_patch = 100
 const number_of_patches = 50
-const individuals_born_per_time_step = 200
+const individuals_born_per_time_step = 1000
 const individuals_left_after_selection = 100
 const selection_cofficient = 0.1
 
 #An individual has a genome, a sex and an id
 struct Individual
     genome:: Tuple{Bool, Bool}
-    sex:: Bool #false == female, true == male
+    sex:: Bool #false = female, true = male
     id:: Int
 end
 
@@ -30,9 +30,10 @@ function create_individual(id,sex)
     return Individual(genome,sex,id)
 end
 
+#create the population of a single patch
 function create_subpopulation(location)
     females = [create_individual(location*individuals_per_patch/2*1 + i,true) for i in 1:Int(floor(individuals_per_patch/2))]
-    males = [create_individual(location*individuals_per_patch/2*1 + i,false) for i in 1:Int(floor(individuals_per_patch/2))]
+    males = [create_individual(location*individuals_per_patch/2*2 + i,false) for i in 1:Int(floor(individuals_per_patch/2))]
     return Patch(females,males,location)
 end
 
@@ -41,7 +42,7 @@ function create_population()
     return patches
 end
 
-
+getfield(create_subpopulation(1),:males)
 
 
 #this mating function pools all gametes in one pool
@@ -77,9 +78,46 @@ struct SexSpecificPatch
     location::Int
 end
 
+#An updated version of the migration function, this time it is non-recursive
+#The older version is still present below, but it will overflow the stack for large populations
+function migration(population::Vector{Patch})::Vector{Patch}
+    function migration_one_sex(population::Vector{Patch}, sex::Symbol)::Vector{Vector{Individual}}
+        current_individuals= [[(ind,patch.location) for ind in getfield(patch, sex)] for patch in population]
+        current_individuals = reduce(vcat,reduce(hcat, current_individuals))
+
+        function migrate_one_individual(individual::Tuple{Individual,Int64})::Tuple{Individual,Int64}
+            signed_distance::Int64 = Int(round(rand(Normal(0,1.5),1)[1]))
+            location = individual[2]
+            location = (1 <= location + signed_distance <= number_of_patches) ? location + signed_distance : location
+            return (individual[1],location)
+        end
+
+        next_individuals = migrate_one_individual.(current_individuals)
+        next_patches = [[] for i in 1:number_of_patches]
+
+        #if the the selection is applied here on the Vector{Tuple{Individual, Int64}} we can avoid iterating over all the individuals
+        for (i,individual) in enumerate(next_individuals)
+            push!(next_patches[individual[2]],individual[1])
+        end
+        
+        return next_patches
+    end
+
+    female_patches = migration_one_sex(population,:females)
+    male_patches = migration_one_sex(population,:males)
+
+    function combine_males_and_females(males::Vector{Individual},females::Vector{Individual},location::Int)::Patch
+        return Patch(males,females,location)
+    end
+
+    return combine_males_and_females.(female_patches,male_patches,1:50)
+end
+
+
+
 #this function as the side effect of making the current population empty, the population must be assigned to the next population
 #This function is a bit of recersive mess, but it should work
-function migration(population::Vector{Patch})::Vector{Patch}
+function recursive_migration(population::Vector{Patch})::Vector{Patch}
     current_females = [SexSpecificPatch(patch.females,false, patch.location) for patch in population]
     current_males = [SexSpecificPatch(patch.males,true, patch.location) for patch in population]
     next_females::Vector{SexSpecificPatch} = [SexSpecificPatch([],false,population[i].location)
@@ -156,6 +194,44 @@ function selection(population::Vector{Patch})::Vector{Patch}
 end
 
 
+function get_allele_frequencies(population::Vector{Patch}, generations::Int64)::Vector{Float64}
+    for n in 1:100
+        population = global_mating(population) |> migration |> selection
+    end
+    return mean.(((patch) -> ((male) -> sum(male.genome)).(patch.males)).(population))
+end
+
+function predicted_allele_frequencie(patch)::Float64
+
+    x = patch - number_of_patches/2
+    if x >= 0
+        return -1 + 3 * tanh(sqrt(selection_cofficient)*x/(2*1.5) + atanh(sqrt(2/3)))^2
+    else
+        return 3 - 3 * tanh(-sqrt(selection_cofficient)*x/(2*1.5) + atanh(sqrt(2/3)))^2
+    end
+end
+
+population = create_population()
+
+
+
+frequencies = [get_allele_frequencies(create_population(),100) for i in 1:100]
+
+plot(frequencies,linestyle = :dashdot, color = "gray", label = "")
+plot!(mean.(collect(eachrow(reduce(hcat, frequencies)))), 
+    title = "Allele frequency in Simple Model, mean of 100 runs",
+    xlabel = "Patch",
+    ylabel = "Allele frequency",
+    line = (3,:black,:dashdot),
+    label = "Mean Observed Allele Frequencies")
+
+predicted_frequencies = [predicted_allele_frequencie(i) for i in range(1,Int(number_of_patches),length = 1000)]
+plot!(range(1,Int(number_of_patches),length = 1000),predicted_frequencies,
+    label = "Predicted allele frequencies",
+    line=(3,:red))
+savefig("BasicModel_with_pred.png")
+
+
 
 
 #Main function
@@ -168,6 +244,7 @@ function main()
         title = "Allele frequency in Simple Model",
         xlabel = "Patch",
         ylabel = "Allele frequency")
+    savefig("BasicModel.png") 
 end
 main()
 ########################################################
